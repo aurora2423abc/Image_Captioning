@@ -18,7 +18,7 @@ except Exception:
 
 import os, io, json, base64, collections, collections.abc, numpy as np, cv2, torch, gradio as gr, time, hashlib, warnings
 from typing import List, Dict
-
+import random
 # Optional: disable Gradio analytics notice
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
@@ -61,9 +61,15 @@ except Exception: pass
 # ========== Paths via env ==========
 YAML        = os.environ.get("BUTD_YAML",   r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/faster_rcnn_R_101_C4_attr_caffemaxpool.yaml")
 WEIGHT      = os.environ.get("BUTD_WEIGHT", r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/faster_rcnn_from_caffe_attr.pkl")
-VOCAB_JSON  = os.environ.get("BUTD_VOCAB",  r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/vocab_coco.json")
-CE_CKPT     = os.environ.get("BUTD_CE_CKPT",   r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/xe_best.pt")
-SCST_CKPT   = os.environ.get("BUTD_SCST_CKPT", r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/scst_best.pt")
+
+VOCAB_JSON_EN  = os.environ.get("BUTD_VOCAB_EN",  r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/vocab_coco.json")
+CE_CKPT_EN     = os.environ.get("BUTD_CE_CKPT_EN",   r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/xe_best.pt")
+SCST_CKPT_EN   = os.environ.get("BUTD_SCST_CKPT_EN", r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/scst_best.pt")
+
+VOCAB_JSON_VI  = os.environ.get("BUTD_VOCAB_VI",  r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/vocab_butd_vi.json")
+CE_CKPT_VI     = os.environ.get("BUTD_CE_CKPT_VI",   r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/butd_vietnamese_best.pt")
+SCST_CKPT_VI   = os.environ.get("BUTD_SCST_CKPT_VI", r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/butd_scst_optimized.pt")
+
 OBJ_VOCAB   = os.environ.get("BUTD_OBJ_VOCAB",  r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/objects_vocab.txt")
 ATTR_VOCAB  = os.environ.get("BUTD_ATTR_VOCAB", r"/home/aurora/Image_Captioning_BUTD/.venv310/checkpoints/attributes_vocab.txt")
 
@@ -99,11 +105,11 @@ def build_butd_predictor(yaml_path, weight_path, device=DEVICE):
 
     # ROI heads Res5 trên đặc trưng res4
     cfg.MODEL.ROI_HEADS.IN_FEATURES = ["res4"]
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.6
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.8
     cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST   = 0.5
 
     # Cho phép nhiều candidate, phần sau tự NMS gộp lớp
-    cfg.TEST.DETECTIONS_PER_IMAGE = max(int(cfg.TEST.DETECTIONS_PER_IMAGE), NUM_OBJECTS * 8, 400)
+    cfg.TEST.DETECTIONS_PER_IMAGE = max(int(cfg.TEST.DETECTIONS_PER_IMAGE), NUM_OBJECTS * 10, 400)
 
     # Resize như BUTD
     cfg.INPUT.MIN_SIZE_TEST = MIN_SIZE_TEST
@@ -128,8 +134,63 @@ def build_butd_predictor(yaml_path, weight_path, device=DEVICE):
     predictor.meta = meta
     return predictor
 
+from transformers import BlipProcessor, BlipForConditionalGeneration, CLIPModel, CLIPProcessor
+# ========== BLIP MODEL ==========
+blip_processor = BlipProcessor.from_pretrained(
+    "Salesforce/blip-image-captioning-base"
+)
+blip_model = BlipForConditionalGeneration.from_pretrained(
+    "Salesforce/blip-image-captioning-base"
+).to(DEVICE)
+blip_model.eval()
+# ========== BLIP CAPTION GENERATOR ==========
+@torch.no_grad()
+def blip_generate_caption(image_pil):
+    inputs = blip_processor(image_pil, return_tensors="pt").to(DEVICE)
+
+    output = blip_model.generate(
+        **inputs,
+        max_length=30,
+        num_beams=5
+    )
+
+    caption = blip_processor.decode(
+        output[0],
+        skip_special_tokens=True
+    )
+    return caption
+# ========== CLIP MODEL ==========
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model = CLIPModel.from_pretrained(
+    "openai/clip-vit-base-patch32"
+).to(device)
+clip_model.eval()
+
+clip_processor = CLIPProcessor.from_pretrained(
+    "openai/clip-vit-base-patch32"
+)
+# ========== CLIP SCORE ON IMAGE ==========
+@torch.no_grad()
+def compute_clip_score(image, caption: str) -> float:
+    inputs = clip_processor(
+        text=[caption],
+        images=image,
+        return_tensors="pt",
+        padding=True
+    ).to(device)
+
+    outputs = clip_model(**inputs)
+
+    img_feat = outputs.image_embeds
+    txt_feat = outputs.text_embeds
+    # normalize
+    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+    txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+
+    score = (img_feat * txt_feat).sum(dim=-1).item()
+    return score
 # ========== Class-agnostic selection + NMS ==========
-def _class_agnostic_select(pred_cls_logits, pred_deltas, proposals, box2box, topk, iou_thr=0.5):
+def _class_agnostic_select(pred_cls_logits, pred_deltas, proposals, box2box, topk, iou_thr=0.45):
     """
     Chọn 1 lớp tốt nhất cho mỗi RoI rồi làm NMS gộp lớp.
     Trả về: keep_idx (R_kept,), boxes_xyxy (N,4), scores (N,), classes (N,)
@@ -202,7 +263,7 @@ def butd_extract_36x2048(predictor, im_bgr: np.ndarray, num_objects: int = NUM_O
             pred_attr_logits = None
 
         # 5) Class-agnostic NMS
-        topk_for_nms = max(num_objects * 6, 300)
+        topk_for_nms = max(num_objects * 4, 200)
         box2box = model.roi_heads.box_predictor.box2box_transform
         keep_idx, kept_boxes, kept_scores, kept_classes = _class_agnostic_select(
             pred_cls_logits, pred_deltas, prop0, box2box, topk=topk_for_nms, iou_thr=0.5
@@ -276,7 +337,7 @@ class UpDownDecoder(nn.Module):
     def forward(self, feats, caps):
         B,R,_ = feats.shape; T = caps.size(1)
         f = self.feat_ln(self.feat_proj(feats))
-        f_mean = f.mean(1)
+        f_mean = torch.sum(f * torch.softmax(f.norm(dim=-1), dim=1).unsqueeze(-1), dim=1)
         H = self.att_lstm.hidden_size
         h_att = feats.new_zeros(B,H); c_att = feats.new_zeros(B,H)
         h_lang = feats.new_zeros(B,H); c_lang = feats.new_zeros(B,H)
@@ -293,7 +354,7 @@ class UpDownDecoder(nn.Module):
     def greedy(self, feats, bos=1, eos=2, max_len=30):
         device = feats.device
         B,R,_ = feats.shape; H = self.att_lstm.hidden_size
-        f = self.feat_ln(self.feat_proj(feats)); f_mean = f.mean(1)
+        f = self.feat_ln(self.feat_proj(feats)); f_mean = torch.sum(f * torch.softmax(f.norm(dim=-1), dim=1).unsqueeze(-1), dim=1)
         h_att = feats.new_zeros(B,H); c_att = feats.new_zeros(B,H)
         h_lang = feats.new_zeros(B,H); c_lang = feats.new_zeros(B,H)
         cur = torch.full((B,), bos, dtype=torch.long, device=device)
@@ -308,10 +369,14 @@ class UpDownDecoder(nn.Module):
         return torch.stack(outs, 1)
 
     @torch.no_grad()
-    def beam_search(self, feats, bos=1, eos=2, pad=0, max_len=30, beam_size=5, length_penalty=0.7, no_repeat_ngram=3):
+    def beam_search(self, feats, bos=1, eos=2, pad=0, max_len=25, beam_size=5, length_penalty=1.2, no_repeat_ngram=2):
         device = feats.device
         B,R,_ = feats.shape; H = self.att_lstm.hidden_size
-        f = self.feat_ln(self.feat_proj(feats)); f_mean = f.mean(1)
+        f = self.feat_ln(self.feat_proj(feats))
+        f_mean = torch.sum(
+            f * torch.softmax(f.norm(dim=-1), dim=1).unsqueeze(-1),
+            dim=1
+        )
         beams = torch.full((B,1,1), bos, dtype=torch.long, device=device)
         scores = torch.zeros(B,1, device=device)
         hA = feats.new_zeros(B,1,H); cA = feats.new_zeros(B,1,H)
@@ -435,24 +500,72 @@ def load_updown_from_ckpt(ckpt_path, itos, tok, device):
 from functools import lru_cache
 @lru_cache()
 def boot_backbone_and_vocab():
-    assert VOCAB_JSON and os.path.isfile(VOCAB_JSON), f"Please set BUTD_VOCAB to a valid vocab.json. Got: {VOCAB_JSON}"
-    itos_list, tok = load_vocab(VOCAB_JSON)
-    predictor = build_butd_predictor(YAML, WEIGHT, device=DEVICE)
-    return predictor, itos_list, tok
-
+    predictor = build_butd_predictor(
+        YAML,
+        WEIGHT,
+        device=DEVICE
+    )
+    return predictor
 @lru_cache()
-def boot_captioner_ce():
-    _, itos_list, tok = boot_backbone_and_vocab()
-    if not CE_CKPT or not os.path.isfile(CE_CKPT):
-        raise FileNotFoundError(f"CE checkpoint not found: {CE_CKPT}")
-    return load_updown_from_ckpt(CE_CKPT, itos_list, tok, DEVICE)
+def boot_captioners_bilingual():
+    # ================== ENGLISH ==================
+    assert os.path.isfile(VOCAB_JSON_EN), f"Missing {VOCAB_JSON_EN}"
+    assert os.path.isfile(CE_CKPT_EN), f"Missing {CE_CKPT_EN}"
 
-@lru_cache()
-def boot_captioner_scst():
-    _, itos_list, tok = boot_backbone_and_vocab()
-    if not SCST_CKPT or not os.path.isfile(SCST_CKPT):
-        raise FileNotFoundError(f"SCST checkpoint not found: {SCST_CKPT}")
-    return load_updown_from_ckpt(SCST_CKPT, itos_list, tok, DEVICE)
+    itos_en, tok_en = load_vocab(VOCAB_JSON_EN)
+
+    ce_en = load_updown_from_ckpt(
+        CE_CKPT_EN,
+        itos_en,
+        tok_en,
+        DEVICE
+    )
+
+    scst_en = None
+    if SCST_CKPT_EN and os.path.isfile(SCST_CKPT_EN):
+        scst_en = load_updown_from_ckpt(
+            SCST_CKPT_EN,
+            itos_en,
+            tok_en,
+            DEVICE
+        )
+
+    # ================== VIETNAMESE ==================
+    assert os.path.isfile(VOCAB_JSON_VI), f"Missing {VOCAB_JSON_VI}"
+    assert os.path.isfile(CE_CKPT_VI), f"Missing {CE_CKPT_VI}"
+
+    itos_vi, tok_vi = load_vocab(VOCAB_JSON_VI)
+
+    ce_vi = load_updown_from_ckpt(
+        CE_CKPT_VI,
+        itos_vi,
+        tok_vi,
+        DEVICE
+    )
+
+    scst_vi = None
+    if SCST_CKPT_VI and os.path.isfile(SCST_CKPT_VI):
+        scst_vi = load_updown_from_ckpt(
+            SCST_CKPT_VI,
+            itos_vi,
+            tok_vi,
+            DEVICE
+        )
+
+    return {
+        "en": {
+            "itos": itos_en,
+            "tok": tok_en,
+            "ce": ce_en,
+            "scst": scst_en
+        },
+        "vi": {
+            "itos": itos_vi,
+            "tok": tok_vi,
+            "ce": ce_vi,
+            "scst": scst_vi   # ✅ SCST VI HỢP LỆ
+        }
+    }
 
 # ========== Visualization helpers ==========
 def _build_labels(inst, meta):
@@ -476,25 +589,39 @@ def _build_labels(inst, meta):
         labels.append(lab)
     return labels
 
-def draw_boxes(img_bgr, boxes_xyxy, labels, topk=None, lw=2):
+def draw_boxes(img_bgr, boxes_xyxy, labels=None, topk=None, lw=1):
+    import random
     img = img_bgr.copy()
-    H,W = img.shape[:2]
+    H, W = img.shape[:2]
     n = len(boxes_xyxy)
-    if topk is not None: n = min(n, topk)
+    if topk is not None:
+        n = min(n, topk)
+
+    random.seed(0)  # ổn định màu
+
     for i in range(n):
-        x1,y1,x2,y2 = boxes_xyxy[i]
-        x1 = int(max(0,min(W-1,x1))); y1=int(max(0,min(H-1,y1)))
-        x2 = int(max(0,min(W-1,x2))); y2=int(max(0,min(H-1,y2)))
-        cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,0), lw)
+        x1, y1, x2, y2 = boxes_xyxy[i]
+        x1 = int(max(0, min(W-1, x1)))
+        y1 = int(max(0, min(H-1, y1)))
+        x2 = int(max(0, min(W-1, x2)))
+        y2 = int(max(0, min(H-1, y2)))
+
+        color = (
+            random.randint(60,255),
+            random.randint(60,255),
+            random.randint(60,255)
+        )
+
+        cv2.rectangle(img, (x1,y1), (x2,y2), color, lw)
+
         if labels and i < len(labels):
             txt = labels[i]
-            (tw,th), baseline = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            bg_y1 = max(0, y1 - th - 6)
-            bg_y2 = bg_y1 + th + 6
-            cv2.rectangle(img, (x1, bg_y1), (x1+tw+6, bg_y2), (0,0,0), -1)
-            cv2.putText(img, txt, (x1+3, bg_y2-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return img_rgb
+            (tw,th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(img, (x1, y1-th-6), (x1+tw+4, y1), color, -1)
+            cv2.putText(img, txt, (x1+2, y1-4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1)
+
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 # ========== Inference pipeline ==========
 _feat_cache = {}
@@ -504,89 +631,259 @@ def _img_hash(pil_image) -> str:
     return hashlib.md5(buf.getvalue()).hexdigest()
 
 @torch.no_grad()
-def run_pipeline(pil_image, k_draw, draw_labels, cache_feats, decode_strategy, beam_size, len_penalty, no_repeat, max_len):
-    predictor, itos_list, tok = boot_backbone_and_vocab()
-    cap_ce = boot_captioner_ce()
-    cap_scst = boot_captioner_scst()
-
+def run_pipeline(
+    pil_image,
+    k_draw,
+    draw_labels,
+    cache_feats,
+    decode_strategy,
+    beam_size,
+    len_penalty,
+    no_repeat,
+    max_len
+):
     if pil_image is None:
-        return None, "Please upload an image.", "Please upload an image.", ""
+        return None, "", "", "", ""
 
-    t0 = time.time()
+    # ===== 1. BLIP caption =====
+    cap_blip_txt = blip_generate_caption(pil_image)
+
+    # ===== 2. Load backbone + captioners =====
+    predictor = boot_backbone_and_vocab()
+    caps = boot_captioners_bilingual()
+
+    # ===== 3. Image → BGR =====
     img_rgb = np.array(pil_image)
     img_bgr = img_rgb[:, :, ::-1].copy()
 
-    key = _img_hash(pil_image) if cache_feats else None
-    if key and key in _feat_cache:
-        inst, feats = _feat_cache[key]
-    else:
-        inst, feats = butd_extract_36x2048(predictor, img_bgr, num_objects=NUM_OBJECTS)
-        if key: _feat_cache[key] = (inst, feats)
-    t_feat = time.time() - t0
+    # ===== 4. Feature extraction (cache nếu có) =====
+    cache_key = None
+    if cache_feats:
+        cache_key = hash(pil_image.tobytes())
 
+    if cache_feats and hasattr(run_pipeline, "_feat_cache") and cache_key in run_pipeline._feat_cache:
+        inst, feats = run_pipeline._feat_cache[cache_key]
+        t_feat = 0.0
+    else:
+        t0 = time.time()
+        inst, feats = butd_extract_36x2048(predictor, img_bgr)
+        t_feat = time.time() - t0
+
+        if cache_feats:
+            if not hasattr(run_pipeline, "_feat_cache"):
+                run_pipeline._feat_cache = {}
+            run_pipeline._feat_cache[cache_key] = (inst, feats)
+
+    feats_t = torch.from_numpy(feats).unsqueeze(0).to(DEVICE)
+
+    # ===== 5. Visualization =====
     inst_cpu = inst.to("cpu")
-    if hasattr(inst_cpu, "scores") and len(inst_cpu) > 0:
-        order = torch.argsort(inst_cpu.scores, descending=True)
-        inst_cpu = inst_cpu[order]
+    boxes = inst_cpu.pred_boxes.tensor.numpy().astype(np.int32)
+    labels = _build_labels(inst_cpu, predictor.meta) if draw_labels else None
+    vis = draw_boxes(img_bgr, boxes, labels, topk=k_draw)
 
-    labels = _build_labels(inst_cpu, getattr(predictor, "meta", None)) if draw_labels else None
-    boxes = inst_cpu.pred_boxes.tensor.numpy().astype(np.int32) if len(inst_cpu)>0 else np.zeros((0,4),dtype=np.int32)
-    vis = draw_boxes(img_bgr, boxes, labels, topk=int(k_draw) if k_draw else None, lw=2)
-
-    feats_t = torch.from_numpy(feats.copy()).unsqueeze(0).to(DEVICE)
+    # =================================================
+    # ===== 6. Decode EN + VI (CE & SCST) ============
+    # =================================================
     t1 = time.time()
-    if decode_strategy == "beam":
-        seq_ce = cap_ce.beam_search(feats_t, bos=tok["BOS"], eos=tok["EOS"], pad=tok["PAD"],
-                                    max_len=int(max_len), beam_size=int(beam_size),
-                                    length_penalty=float(len_penalty), no_repeat_ngram=int(no_repeat))[0].tolist()
-        seq_sc = cap_scst.beam_search(feats_t, bos=tok["BOS"], eos=tok["EOS"], pad=tok["PAD"],
-                                      max_len=int(max_len), beam_size=int(beam_size),
-                                      length_penalty=float(len_penalty), no_repeat_ngram=int(no_repeat))[0].tolist()
-    else:
-        seq_ce = cap_ce.greedy(feats_t, bos=tok["BOS"], eos=tok["EOS"], max_len=int(max_len))[0].tolist()
-        seq_sc = cap_scst.greedy(feats_t, bos=tok["BOS"], eos=tok["EOS"], max_len=int(max_len))[0].tolist()
-    t_decode = time.time() - t1
 
-    cap_text_ce = ids_to_text(seq_ce, itos_list, BOS_id=tok["BOS"], EOS_id=tok["EOS"], PAD_id=tok["PAD"])
-    cap_text_sc = ids_to_text(seq_sc, itos_list, BOS_id=tok["BOS"], EOS_id=tok["EOS"], PAD_id=tok["PAD"])
-    timing = f"features: {t_feat*1000:.0f} ms | decode: {t_decode*1000:.0f} ms (strategy={decode_strategy}, beam={beam_size}, len_pen={len_penalty}, nrep={no_repeat}, L={max_len})"
+    def decode(model, tok):
+        if decode_strategy == "beam":
+            return model.beam_search(
+                feats_t,
+                bos=tok["BOS"],
+                eos=tok["EOS"],
+                pad=tok["PAD"],
+                max_len=int(max_len),
+                beam_size=int(beam_size),
+                length_penalty=float(len_penalty),
+                no_repeat_ngram=int(no_repeat)
+            )[0]
+        else:
+            return model.greedy(feats_t)[0]
 
-    return vis, f"[CE] {cap_text_ce}", f"[SCST] {cap_text_sc}", timing
+    # ---------- EN ----------
+    en = caps["en"]
+    seq_ce_en = decode(en["ce"], en["tok"])
+    cap_ce_en = ids_to_text(seq_ce_en.tolist(), en["itos"], en["tok"]["BOS"], en["tok"]["EOS"], en["tok"]["PAD"])
+
+    cap_sc_en = ""
+    if en["scst"] is not None:
+        seq_sc_en = decode(en["scst"], en["tok"])
+        cap_sc_en = ids_to_text(seq_sc_en.tolist(), en["itos"], en["tok"]["BOS"], en["tok"]["EOS"], en["tok"]["PAD"])
+
+    # ---------- VI ----------
+    vi = caps["vi"]
+    seq_ce_vi = decode(vi["ce"], vi["tok"])
+    cap_ce_vi = ids_to_text(seq_ce_vi.tolist(), vi["itos"], vi["tok"]["BOS"], vi["tok"]["EOS"], vi["tok"]["PAD"])
+
+    cap_sc_vi = ""
+    if vi["scst"] is not None:
+        seq_sc_vi = decode(vi["scst"], vi["tok"])
+        cap_sc_vi = ids_to_text(seq_sc_vi.tolist(), vi["itos"], vi["tok"]["BOS"], vi["tok"]["EOS"], vi["tok"]["PAD"])
+
+    t_dec = time.time() - t1
+
+    # ===== 7. CLIPScore =====
+    clip_ce_en = compute_clip_score(pil_image, cap_ce_en)
+    clip_ce_vi = compute_clip_score(pil_image, cap_ce_vi)
+    clip_sc_en = compute_clip_score(pil_image, cap_sc_en) if cap_sc_en else None
+    clip_sc_vi = compute_clip_score(pil_image, cap_sc_vi) if cap_sc_vi else None
+    clip_blip  = compute_clip_score(pil_image, cap_blip_txt)
+
+    # ===== 8. Outputs =====
+    out_ce_txt = (
+        f"[BUTD-CE | EN]\n{cap_ce_en}\nCLIPScore: {clip_ce_en:.3f}\n\n"
+        f"[BUTD-CE | VI]\n{cap_ce_vi}\nCLIPScore: {clip_ce_vi:.3f}"
+    )
+
+    out_sc_txt = ""
+    if cap_sc_en:
+        out_sc_txt += f"[BUTD-SCST | EN]\n{cap_sc_en}\nCLIPScore: {clip_sc_en:.3f}\n\n"
+    if cap_sc_vi:
+        out_sc_txt += f"[BUTD-SCST | VI]\n{cap_sc_vi}\nCLIPScore: {clip_sc_vi:.3f}"
+
+    out_bl_txt = f"[BLIP]\n{cap_blip_txt}\nCLIPScore: {clip_blip:.3f}"
+
+    timing = f"features {t_feat*1000:.0f} ms | decode {t_dec*1000:.0f} ms"
+
+    return vis, out_ce_txt, out_sc_txt, out_bl_txt, timing
 
 # ========== UI ==========
-with gr.Blocks(title="COCO Captioning (BUTD + UpDown) – CE vs SCST", css=".gr-button {min-width: 120px;}") as demo:
-    gr.Markdown("### Image Captioning on COCO using Bottom-Up Top-Down (BUTD) features with UpDown 2-LSTM decoder\n")
+with gr.Blocks(title="Image Captioning") as demo:
+    gr.Markdown(
+        "## BOTTOM-UP AND TOP-DOWN IMAGE CAPTIONING\n"
+        "**CE + SCST: English + Vietnamese **"
+    )
+
     with gr.Row():
+        # -------- Controls --------
         with gr.Column(scale=1):
             inp = gr.Image(type="pil", label="Upload image")
-            k_draw = gr.Slider(1, NUM_OBJECTS, value=10, step=1, label="Top-K boxes to draw")
-            draw_labels = gr.Checkbox(value=True, label="Draw labels/scores")
-            cache_feats = gr.Checkbox(value=True, label="Cache features by image")
-            decode_strategy = gr.Dropdown(["beam","greedy"], value="beam", label="Decode strategy")
-            beam_size = gr.Slider(1, 10, value=5, step=1, label="Beam size")
-            len_penalty = gr.Slider(0.0, 2.0, value=0.7, step=0.05, label="Length penalty")
-            no_repeat = gr.Slider(0, 6, value=3, step=1, label="No-repeat n-gram (0=off)")
-            max_len = gr.Slider(5, 40, value=20, step=1, label="Max length")
-            btn = gr.Button("Run", variant="primary")
+
+            k_draw = gr.Slider(
+                minimum=1,
+                maximum=36,
+                value=10,
+                step=1,
+                label="Top-K detected regions"
+            )
+
+            draw_labels = gr.Checkbox(
+                value=True,
+                label="Draw object / attribute labels"
+            )
+
+            cache_feats = gr.Checkbox(
+                value=True,
+                label="Cache extracted features"
+            )
+
+            decode_strategy = gr.Dropdown(
+                choices=["beam", "greedy"],
+                value="beam",
+                label="Decoding strategy"
+            )
+
+            beam_size = gr.Slider(
+                minimum=1,
+                maximum=10,
+                value=7,
+                step=1,
+                label="Beam size (for beam search)"
+            )
+
+            len_penalty = gr.Slider(
+                minimum=0.0,
+                maximum=2.0,
+                value=1.2,
+                step=0.05,
+                label="Length penalty"
+            )
+
+            no_repeat = gr.Slider(
+                minimum=0,
+                maximum=6,
+                value=2,
+                step=1,
+                label="No-repeat ngram size"
+            )
+
+            max_len = gr.Slider(
+                minimum=5,
+                maximum=40,
+                value=25,
+                step=1,
+                label="Maximum caption length"
+            )
+
+            btn = gr.Button("Run Captioning", variant="primary")
+
+        # -------- Outputs --------
         with gr.Column(scale=2):
-            out_img = gr.Image(type="numpy", label="Detections")
-            with gr.Row():
-                out_ce = gr.Textbox(lines=2, label="Caption (CE)")
-                out_sc = gr.Textbox(lines=2, label="Caption (SCST)")
-            timing = gr.Textbox(lines=1, label="Timing (ms)")
+            out_img = gr.Image(label="Detected regions (Bottom-Up Attention)")
 
-    btn.click(fn=run_pipeline,
-              inputs=[inp, k_draw, draw_labels, cache_feats, decode_strategy, beam_size, len_penalty, no_repeat, max_len],
-              outputs=[out_img, out_ce, out_sc, timing])
+            out_ce = gr.Textbox(
+                label="BUTD – Cross Entropy (English + Vietnamese)",
+                lines=6
+            )
 
-    # auto-refresh on controls
-    inp.change(fn=run_pipeline,
-               inputs=[inp, k_draw, draw_labels, cache_feats, decode_strategy, beam_size, len_penalty, no_repeat, max_len],
-               outputs=[out_img, out_ce, out_sc, timing])
-    for ctrl in [k_draw, draw_labels, cache_feats, decode_strategy, beam_size, len_penalty, no_repeat, max_len]:
-        ctrl.change(fn=run_pipeline,
-                    inputs=[inp, k_draw, draw_labels, cache_feats, decode_strategy, beam_size, len_penalty, no_repeat, max_len],
-                    outputs=[out_img, out_ce, out_sc, timing])
+            out_sc = gr.Textbox(
+                label="BUTD – SCST (English + Vietnamese)",
+                lines=4
+            )
+
+            out_blip = gr.Textbox(
+                label="BLIP baseline (English)",
+                lines=3
+            )
+
+            timing = gr.Textbox(label="Runtime")
+
+    # -------- Events --------
+    btn.click(
+        fn=run_pipeline,
+        inputs=[
+            inp,
+            k_draw,
+            draw_labels,
+            cache_feats,
+            decode_strategy,
+            beam_size,
+            len_penalty,
+            no_repeat,
+            max_len
+        ],
+        outputs=[
+            out_img,
+            out_ce,
+            out_sc,
+            out_blip,
+            timing
+        ]
+    )
+
+    inp.change(
+        fn=run_pipeline,
+        inputs=[
+            inp,
+            k_draw,
+            draw_labels,
+            cache_feats,
+            decode_strategy,
+            beam_size,
+            len_penalty,
+            no_repeat,
+            max_len
+        ],
+        outputs=[
+            out_img,
+            out_ce,
+            out_sc,
+            out_blip,
+            timing
+        ]
+    )
 
 if __name__ == "__main__":
     demo.queue().launch(
